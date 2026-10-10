@@ -1,0 +1,28 @@
+[package]
+name = "ramdisplay"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "Click-through Wayland layer-shell widget that visualises live memory pressure"
+license = "MIT"
+repository = "https://example.com/ramdisplay"
+keywords = ["wayland", "hyprland", "layer-shell", "widget", "cairo"]
+categories = ["gui"]
+
+[dependencies]
+# GTK4 gives us the frame clock, Cairo drawing and native Wayland surfaces.
+# Renamed to `gtk` for terse, conventional call sites.
+gtk = { package = "gtk4", version = "0.11" }
+# Turns any GtkWindow into a wlr-layer-shell surface (background/bottom/top/overlay).
+gtk4-layer-shell = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+# Only used by the offscreen preview test, which writes PNG frames.
+cairo-rs = { version = "0.22", features = ["png"] }

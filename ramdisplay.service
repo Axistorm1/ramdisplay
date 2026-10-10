@@ -1,0 +1,20 @@
+[Unit]
+Description=ramdisplay — memory-pressure visualizer (Wayland layer-shell)
+Documentation=file://%h/ramdisplay/README.md
+# Only start inside a graphical Wayland session.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Prefer the absolute path; %h expands to your home directory.
+ExecStart=%h/.cargo/bin/ramdisplay --cell 18 --fps 60
+# Make sure GTK picks the Wayland backend.
+Environment=GDK_BACKEND=wayland
+Restart=on-failure
+RestartSec=2
+# Nice the renderer slightly so it never competes with foreground apps.
+Nice=5
+
+[Install]
+WantedBy=graphical-session.target
