@@ -21,12 +21,16 @@
 //!   occluded the compositor stops sending frame callbacks, so the widget costs
 //!   ~0 % CPU while hidden and animates smoothly when visible.
 //! * **Reactive visuals** — animation speed, particle density, glow and the
-//!   colour gradient (cool cyan → green → amber → red) are continuously driven
+//!   colour gradient (baseline → warning → critical) are continuously driven
 //!   by exponentially smoothed RAM / swap / cache fractions.
+//! * **Themes** — named presets (`matrix`, `cyberpunk`, `amber`, `ocean`) plus
+//!   per-property overrides from a config file or CLI flags control the colour
+//!   gradient, head highlight, font, bloom and glyph scaling. See [`Theme`].
 //!
 //! Run `ramdisplay --help` for options.
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -259,6 +263,307 @@ fn spawn_reader(stats: Arc<SharedStats>, interval: Duration, force_simulate: boo
 }
 
 // ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+/// A linear RGB colour with components in `[0, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rgb {
+    r: f64,
+    g: f64,
+    b: f64,
+}
+
+impl Rgb {
+    const fn new(r: u8, g: u8, b: u8) -> Self {
+        Rgb {
+            r: r as f64 / 255.0,
+            g: g as f64 / 255.0,
+            b: b as f64 / 255.0,
+        }
+    }
+
+    /// Parse `#RRGGBB`, `RRGGBB`, `#RGB` or `RGB` (case-insensitive, optional
+    /// leading `#`). Returns `None` for anything else so callers can warn.
+    fn parse_hex(s: &str) -> Option<Self> {
+        fn nibble(c: u8) -> Option<u8> {
+            match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                b'A'..=b'F' => Some(c - b'A' + 10),
+                _ => None,
+            }
+        }
+        let s = s.trim().trim_start_matches('#');
+        let bytes = s.as_bytes();
+        match bytes.len() {
+            // Shorthand `RGB`: each nibble is doubled (`f` -> `ff`).
+            3 => Some(Rgb::new(
+                nibble(bytes[0])? * 17,
+                nibble(bytes[1])? * 17,
+                nibble(bytes[2])? * 17,
+            )),
+            6 => {
+                let byte = |i: usize| Some(nibble(bytes[i])? * 16 + nibble(bytes[i + 1])?);
+                Some(Rgb::new(byte(0)?, byte(2)?, byte(4)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Linear interpolation toward `other`; `t = 0` yields `self`, `t = 1`
+    /// yields `other`.
+    fn lerp(self, other: Rgb, t: f64) -> Rgb {
+        let t = t.clamp(0.0, 1.0);
+        Rgb {
+            r: self.r + (other.r - self.r) * t,
+            g: self.g + (other.g - self.g) * t,
+            b: self.b + (other.b - self.b) * t,
+        }
+    }
+}
+
+/// Default monospace family. Cairo silently falls back to the system default
+/// when the requested family is not installed.
+const DEFAULT_FONT: &str = "monospace";
+
+/// A fully-resolved visual theme. Presets live in [`Theme::preset`]; individual
+/// fields can be layered on top with a config file and/or CLI flags via
+/// [`ThemeOverrides`].
+#[derive(Clone, Debug)]
+struct Theme {
+    /// Baseline (low pressure) trail colour.
+    start: Rgb,
+    /// Mid-point ("warning") trail colour around half pressure.
+    warning: Rgb,
+    /// Critical colour at maximum RAM / swap pressure.
+    critical: Rgb,
+    /// Leading-glyph highlight colour.
+    head: Rgb,
+    /// Monospace font family.
+    font: String,
+    /// Whether the additive bloom pass runs at all.
+    bloom: bool,
+    /// Multiplier on the additive bloom kernel.
+    bloom_scale: f64,
+    /// Glyph size as a fraction of the cell, scaled.
+    glyph_scale: f64,
+    /// Trail persistence multiplier (larger = longer tails).
+    trail_fade: f64,
+}
+
+impl Theme {
+    /// Names accepted by `--theme` / `--list-themes`, in display order.
+    const PRESETS: [&'static str; 4] = ["matrix", "cyberpunk", "amber", "ocean"];
+
+    /// Resolve a built-in preset by name (case-insensitive, a few aliases).
+    /// Returns `None` for an unknown name so callers can warn and fall back.
+    fn preset(name: &str) -> Option<Theme> {
+        let base = |start: Rgb, warning: Rgb, critical: Rgb, head: Rgb| Theme {
+            start,
+            warning,
+            critical,
+            head,
+            font: DEFAULT_FONT.to_string(),
+            bloom: true,
+            bloom_scale: 1.0,
+            glyph_scale: 1.0,
+            trail_fade: 1.0,
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            // Classic Matrix: green -> yellow -> red.
+            "matrix" | "default" => Some(base(
+                Rgb::new(0, 200, 70),
+                Rgb::new(255, 200, 0),
+                Rgb::new(255, 45, 45),
+                Rgb::new(225, 255, 235),
+            )),
+            // Neon cyan / violet / magenta.
+            "cyberpunk" | "neon" => Some(base(
+                Rgb::new(0, 240, 255),
+                Rgb::new(170, 90, 255),
+                Rgb::new(255, 0, 200),
+                Rgb::new(255, 255, 255),
+            )),
+            // Monochrome retro amber (green/amber phosphor).
+            "amber" | "retro" => Some(base(
+                Rgb::new(255, 150, 0),
+                Rgb::new(255, 205, 90),
+                Rgb::new(255, 60, 0),
+                Rgb::new(255, 245, 210),
+            )),
+            // Cool ocean blues, deepening with pressure.
+            "ocean" | "blue" => Some(base(
+                Rgb::new(0, 90, 160),
+                Rgb::new(0, 180, 216),
+                Rgb::new(80, 180, 255),
+                Rgb::new(220, 245, 255),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Trail colour for the current pressure `heat` (0..1): `start` blending
+    /// through `warning` below half, then into `critical` above it.
+    fn gradient(&self, heat: f64) -> Rgb {
+        let heat = heat.clamp(0.0, 1.0);
+        if heat < 0.5 {
+            self.start.lerp(self.warning, heat * 2.0)
+        } else {
+            self.warning.lerp(self.critical, (heat - 0.5) * 2.0)
+        }
+    }
+
+    /// Leading-glyph colour: the highlight, gently tinted by the trail so heads
+    /// stay legible at every pressure level.
+    fn head_color(&self, heat: f64) -> Rgb {
+        self.head.lerp(self.gradient(heat), 0.25)
+    }
+}
+
+/// Field-by-field theme overrides. Every field is optional so values can be
+/// layered with clear precedence: preset < config file < CLI.
+#[derive(Default, Debug)]
+struct ThemeOverrides {
+    color_start: Option<Rgb>,
+    color_warning: Option<Rgb>,
+    color_critical: Option<Rgb>,
+    color_head: Option<Rgb>,
+    font: Option<String>,
+    bloom: Option<bool>,
+    bloom_scale: Option<f64>,
+    glyph_scale: Option<f64>,
+    trail_fade: Option<f64>,
+}
+
+impl ThemeOverrides {
+    /// Apply each set field to `theme`, clamping numeric fields to sane ranges.
+    fn apply_to(&self, theme: &mut Theme) {
+        if let Some(v) = self.color_start {
+            theme.start = v;
+        }
+        if let Some(v) = self.color_warning {
+            theme.warning = v;
+        }
+        if let Some(v) = self.color_critical {
+            theme.critical = v;
+        }
+        if let Some(v) = self.color_head {
+            theme.head = v;
+        }
+        if let Some(ref v) = self.font {
+            theme.font = v.clone();
+        }
+        if let Some(v) = self.bloom {
+            theme.bloom = v;
+        }
+        if let Some(v) = self.bloom_scale {
+            theme.bloom_scale = v.max(0.0);
+        }
+        if let Some(v) = self.glyph_scale {
+            theme.glyph_scale = v.clamp(0.1, 4.0);
+        }
+        if let Some(v) = self.trail_fade {
+            theme.trail_fade = v.clamp(0.05, 8.0);
+        }
+    }
+}
+
+/// Values discovered in the optional config file.
+#[derive(Default)]
+struct FileConfig {
+    /// A `theme = <name>` line, if present.
+    theme: Option<String>,
+    overrides: ThemeOverrides,
+}
+
+/// Default config location: `$XDG_CONFIG_HOME/ramdisplay/config`, falling back
+/// to `~/.config/ramdisplay/config`.
+fn default_config_path() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("ramdisplay/config"));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/ramdisplay/config"))
+}
+
+/// Parse the tiny `key = value` config format. Comment (`#`) and blank lines
+/// are ignored; unknown keys and malformed values are reported and skipped so a
+/// typo never stops the widget from starting.
+fn load_config(path: &Path, explicit: bool) -> FileConfig {
+    let mut cfg = FileConfig::default();
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            if explicit {
+                eprintln!("ramdisplay: cannot read config `{}`: {e}", path.display());
+            }
+            return cfg;
+        }
+    };
+
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lineno = i + 1;
+        let Some((key, raw_value)) = line.split_once('=') else {
+            eprintln!(
+                "ramdisplay: config {}:{lineno}: expected `key = value`",
+                path.display()
+            );
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase().replace('-', "_");
+        let value = raw_value.trim().trim_matches('"').trim_matches('\'');
+
+        let set_color = |slot: &mut Option<Rgb>| match Rgb::parse_hex(value) {
+            Some(c) => *slot = Some(c),
+            None => eprintln!(
+                "ramdisplay: config {}:{lineno}: invalid colour `{value}` for `{key}`",
+                path.display()
+            ),
+        };
+        let set_f64 = |slot: &mut Option<f64>| match value.parse::<f64>() {
+            Ok(v) => *slot = Some(v),
+            Err(_) => eprintln!(
+                "ramdisplay: config {}:{lineno}: invalid number `{value}` for `{key}`",
+                path.display()
+            ),
+        };
+        let set_bool = |slot: &mut Option<bool>| match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => *slot = Some(true),
+            "0" | "false" | "no" | "off" => *slot = Some(false),
+            _ => eprintln!(
+                "ramdisplay: config {}:{lineno}: invalid boolean `{value}` for `{key}`",
+                path.display()
+            ),
+        };
+
+        match key.as_str() {
+            "theme" => cfg.theme = Some(value.to_string()),
+            "color_start" | "start" => set_color(&mut cfg.overrides.color_start),
+            "color_warning" | "warning" => set_color(&mut cfg.overrides.color_warning),
+            "color_critical" | "critical" => set_color(&mut cfg.overrides.color_critical),
+            "color_head" | "head" => set_color(&mut cfg.overrides.color_head),
+            "font" => cfg.overrides.font = Some(value.to_string()),
+            "bloom" => set_bool(&mut cfg.overrides.bloom),
+            "bloom_scale" => set_f64(&mut cfg.overrides.bloom_scale),
+            "glyph_scale" => set_f64(&mut cfg.overrides.glyph_scale),
+            "trail_fade" => set_f64(&mut cfg.overrides.trail_fade),
+            other => eprintln!(
+                "ramdisplay: config {}:{lineno}: unknown key `{other}`",
+                path.display()
+            ),
+        }
+    }
+    cfg
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -277,6 +582,8 @@ struct Opts {
     monitor: Option<i32>,
     /// Force simulated metrics (ignore `/proc/meminfo`).
     simulate: bool,
+    /// Fully-resolved visual theme (preset + config + CLI overrides).
+    theme: Theme,
 }
 
 impl Default for Opts {
@@ -291,6 +598,7 @@ impl Default for Opts {
             namespace: "ramdisplay".to_string(),
             monitor: None,
             simulate: false,
+            theme: Theme::preset("matrix").expect("matrix preset is built in"),
         }
     }
 }
@@ -301,41 +609,102 @@ fn print_help() {
          \n\
          USAGE:\n    ramdisplay [OPTIONS]\n\
          \n\
-         OPTIONS:\n\
+         LAYOUT:\n\
          \x20   -f, --fullscreen        Fill the whole monitor (100vw x 100vh) [default]\n\
          \x20       --windowed          Run as a centered window instead (see --size)\n\
          \x20       --size <px>         Window edge length in windowed mode [default: 380]\n\
          \x20       --cell <px>         Rain glyph cell size [default: 18]\n\
          \x20       --glyphs <set>      hex | binary | decimal [default: hex]\n\
-         \x20       --simulate          Force simulated RAM metrics (ignore /proc/meminfo)\n\
          \x20       --fps <n>           Frame-rate cap [default: 60]\n\
-         \x20       --poll-ms <n>       /proc/meminfo polling interval [default: 500]\n\
-         \x20       --namespace <s>     Layer-shell namespace [default: ramdisplay]\n\
          \x20       --monitor <n>       Place on monitor index n [default: compositor choice]\n\
+         \x20       --namespace <s>     Layer-shell namespace [default: ramdisplay]\n\
+         \n\
+         THEME:\n\
+         \x20       --theme <name>      Preset: matrix | cyberpunk | amber | ocean [default: matrix]\n\
+         \x20       --color-start <hex> Baseline (low pressure) trail colour\n\
+         \x20       --color-warning <hex> Mid-pressure warning colour\n\
+         \x20       --color-critical <hex> High pressure / swap colour\n\
+         \x20       --color-head <hex>  Leading-glyph highlight colour\n\
+         \x20       --font <family>     Monospace font family [default: monospace]\n\
+         \x20       --no-bloom          Disable the additive bloom pass (cheaper)\n\
+         \x20       --bloom-scale <x>   Scale additive bloom intensity [default: 1.0]\n\
+         \x20       --glyph-scale <x>   Scale glyph size within the cell [default: 1.0]\n\
+         \x20       --trail-fade <x>    Scale trail persistence [default: 1.0]\n\
+         \x20       --config <path>     Load theme overrides from a config file\n\
+         \x20       --no-config         Ignore the default config file\n\
+         \x20       --list-themes       List built-in theme presets and exit\n\
+         \n\
+         METRICS:\n\
+         \x20       --simulate          Force simulated RAM metrics (ignore /proc/meminfo)\n\
+         \x20       --poll-ms <n>       /proc/meminfo polling interval [default: 500]\n\
          \x20   -h, --help              Print this help"
     );
 }
 
-fn parse_args() -> (Opts, bool) {
+/// What the process should do after argument parsing.
+enum Startup {
+    Run,
+    Help,
+    ListThemes,
+}
+
+/// Fetch a flag's value from either `--flag=value` or the following argument.
+fn take_value(inline: Option<String>, args: &mut impl Iterator<Item = String>) -> Option<String> {
+    inline.or_else(|| args.next())
+}
+
+/// Store a parsed `--color-*` value, warning (but continuing) on bad hex.
+fn set_cli_color(slot: &mut Option<Rgb>, value: Option<String>) {
+    if let Some(s) = value {
+        match Rgb::parse_hex(&s) {
+            Some(c) => *slot = Some(c),
+            None => eprintln!("ramdisplay: invalid colour `{s}` (expected e.g. #00ff41)"),
+        }
+    }
+}
+
+/// Store a parsed numeric override, warning (but continuing) on bad input.
+fn set_cli_f64(slot: &mut Option<f64>, value: Option<String>) {
+    if let Some(s) = value {
+        match s.parse::<f64>() {
+            Ok(v) => *slot = Some(v),
+            Err(_) => eprintln!("ramdisplay: invalid number `{s}`"),
+        }
+    }
+}
+
+fn parse_args() -> (Opts, Startup) {
     let mut opts = Opts::default();
-    let mut help = false;
+    let mut startup = Startup::Run;
+
+    // Raw CLI values; the final theme is resolved after the config file loads.
+    let mut cli_theme: Option<String> = None;
+    let mut overrides = ThemeOverrides::default();
+    let mut config_path: Option<PathBuf> = None;
+    let mut no_config = false;
+
     let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
+    while let Some(raw) = args.next() {
+        // Support both `--flag value` and `--flag=value`.
+        let (arg, inline) = match raw.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (raw, None),
+        };
         match arg.as_str() {
             "-f" | "--fullscreen" => opts.fullscreen = true,
             "--windowed" | "--no-fullscreen" => opts.fullscreen = false,
             "--size" => {
-                if let Some(v) = args.next().and_then(|v| v.parse().ok()) {
+                if let Some(v) = take_value(inline, &mut args).and_then(|v| v.parse().ok()) {
                     opts.size = v;
                 }
             }
             "--cell" => {
-                if let Some(v) = args.next().and_then(|v| v.parse().ok()) {
+                if let Some(v) = take_value(inline, &mut args).and_then(|v| v.parse().ok()) {
                     opts.cell = v;
                 }
             }
             "--glyphs" => {
-                if let Some(v) = args.next() {
+                if let Some(v) = take_value(inline, &mut args) {
                     match GlyphSet::parse(&v) {
                         Some(set) => opts.glyphs = set,
                         None => eprintln!(
@@ -344,32 +713,124 @@ fn parse_args() -> (Opts, bool) {
                     }
                 }
             }
-            "--simulate" => opts.simulate = true,
             "--fps" => {
-                if let Some(v) = args.next().and_then(|v| v.parse().ok()) {
+                if let Some(v) = take_value(inline, &mut args).and_then(|v| v.parse().ok()) {
                     opts.fps = v;
                 }
             }
             "--poll-ms" => {
-                if let Some(v) = args.next().and_then(|v| v.parse().ok()) {
+                if let Some(v) = take_value(inline, &mut args).and_then(|v| v.parse().ok()) {
                     opts.poll_ms = v;
                 }
             }
             "--namespace" => {
-                if let Some(v) = args.next() {
+                if let Some(v) = take_value(inline, &mut args) {
                     opts.namespace = v;
                 }
             }
             "--monitor" => {
-                if let Some(v) = args.next().and_then(|v| v.parse().ok()) {
+                if let Some(v) = take_value(inline, &mut args).and_then(|v| v.parse().ok()) {
                     opts.monitor = Some(v);
                 }
             }
-            "-h" | "--help" => help = true,
+            "--simulate" => opts.simulate = true,
+            // --- theme selection & overrides ---
+            "--theme" => {
+                if let Some(v) = take_value(inline, &mut args) {
+                    cli_theme = Some(v);
+                }
+            }
+            "--color-start" => {
+                set_cli_color(&mut overrides.color_start, take_value(inline, &mut args))
+            }
+            "--color-warning" => {
+                set_cli_color(&mut overrides.color_warning, take_value(inline, &mut args))
+            }
+            "--color-critical" => {
+                set_cli_color(&mut overrides.color_critical, take_value(inline, &mut args))
+            }
+            "--color-head" => {
+                set_cli_color(&mut overrides.color_head, take_value(inline, &mut args))
+            }
+            "--font" => {
+                if let Some(v) = take_value(inline, &mut args) {
+                    overrides.font = Some(v);
+                }
+            }
+            "--no-bloom" => overrides.bloom = Some(false),
+            "--bloom" => overrides.bloom = Some(true),
+            "--bloom-scale" => {
+                set_cli_f64(&mut overrides.bloom_scale, take_value(inline, &mut args))
+            }
+            "--glyph-scale" => {
+                set_cli_f64(&mut overrides.glyph_scale, take_value(inline, &mut args))
+            }
+            "--trail-fade" => set_cli_f64(&mut overrides.trail_fade, take_value(inline, &mut args)),
+            // --- config file ---
+            "--config" => {
+                if let Some(v) = take_value(inline, &mut args) {
+                    config_path = Some(PathBuf::from(v));
+                    no_config = false;
+                }
+            }
+            "--no-config" => {
+                no_config = true;
+                config_path = None;
+            }
+            "--list-themes" => startup = Startup::ListThemes,
+            "-h" | "--help" => startup = Startup::Help,
             other => eprintln!("ramdisplay: ignoring unknown argument `{other}`"),
         }
     }
-    (opts, help)
+
+    // Resolve the theme with clear precedence: preset < config file < CLI.
+    let config = if no_config {
+        FileConfig::default()
+    } else {
+        let (path, explicit) = match config_path {
+            Some(p) => (Some(p), true),
+            None => (default_config_path(), false),
+        };
+        path.map(|p| load_config(&p, explicit)).unwrap_or_default()
+    };
+
+    let name = cli_theme
+        .as_deref()
+        .or(config.theme.as_deref())
+        .unwrap_or("matrix");
+    let mut theme = match Theme::preset(name) {
+        Some(t) => t,
+        None => {
+            eprintln!("ramdisplay: unknown theme `{name}`; using `matrix` (see --list-themes)");
+            Theme::preset("matrix").expect("matrix preset is built in")
+        }
+    };
+    config.overrides.apply_to(&mut theme);
+    overrides.apply_to(&mut theme);
+    opts.theme = theme;
+
+    (opts, startup)
+}
+
+/// Print the built-in presets and the fine-tuning knobs, for `--list-themes`.
+fn print_themes() {
+    println!("ramdisplay — built-in theme presets:\n");
+    for name in Theme::PRESETS {
+        let desc = match name {
+            "matrix" => "classic green -> yellow -> red",
+            "cyberpunk" => "neon cyan / violet / magenta",
+            "amber" => "monochrome retro amber phosphor",
+            "ocean" => "cool ocean blues",
+            _ => "",
+        };
+        println!("  {name:<10} {desc}");
+    }
+    println!(
+        "\nSelect one with `--theme <name>`, then override any property:\n\
+         \x20 --color-start/-warning/-critical/-head <hex>   --font <family>\n\
+         \x20 --bloom-scale <x>   --glyph-scale <x>   --trail-fade <x>   --no-bloom\n\
+         \nDefaults can also be set in $XDG_CONFIG_HOME/ramdisplay/config."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -385,41 +846,6 @@ fn rand01(state: &mut u64) -> f64 {
     x ^= x << 17;
     *state = x;
     ((x >> 11) as f64) / ((1u64 << 53) as f64)
-}
-
-fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
-    let h = (h / 60.0).rem_euclid(6.0);
-    let c = v * s;
-    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
-    let m = v - c;
-    let (r, g, b) = match h as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    (r + m, g + m, b + m)
-}
-
-/// Trail colour. Classic Matrix green that slides through yellow toward red as
-/// RAM (and swap) pressure grows — the "warning" end of the gradient.
-fn rain_color(load: f64, swap: f64) -> (f64, f64, f64) {
-    let heat = (load + swap * 0.35).clamp(0.0, 1.0);
-    let hue = 120.0 * (1.0 - heat); // 120° green -> 0° red
-    hsv_to_rgb(hue, 0.85, 0.55 + 0.35 * heat)
-}
-
-/// Head glyph colour: near-white, tinted by the trail colour so the leading
-/// character of every stream pops.
-fn head_color(load: f64) -> (f64, f64, f64) {
-    let (r, g, b) = rain_color(load, 0.0);
-    (
-        (r * 0.30 + 0.70).min(1.0),
-        (g * 0.30 + 0.70).min(1.0),
-        (b * 0.30 + 0.70).min(1.0),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +937,8 @@ struct Visual {
     /// One stream per grid column.
     streams: Vec<Stream>,
     glyph_set: GlyphSet,
+    /// Resolved colours, font and visual tweaks. Cloned once at startup.
+    theme: Theme,
 
     rng: u64,
     min_frame: f64,
@@ -531,6 +959,7 @@ impl Visual {
             intens: Vec::new(),
             streams: Vec::new(),
             glyph_set: opts.glyphs,
+            theme: opts.theme.clone(),
             rng: 0x9E37_79B9_7F4A_7C15_u64,
             min_frame: 1.0 / opts.fps.max(1.0),
         }
@@ -584,8 +1013,9 @@ impl Visual {
         // --- memory -> motion / density ---
         // Higher pressure: streams fall faster and their trails persist longer
         // (a longer decay time constant), so the screen fills with more glyphs.
+        // `trail_fade` lets a theme stretch or clip that persistence.
         let speed_mul = 0.6 + load * 4.5;
-        let tau = 0.28 + load * 1.4;
+        let tau = (0.28 + load * 1.4) * self.theme.trail_fade;
         let decay = (-dt / tau).exp() as f32;
 
         for v in self.intens.iter_mut() {
@@ -663,14 +1093,17 @@ impl Visual {
 
         let load = self.ram.clamp(0.0, 1.0);
         let swap = self.swap.clamp(0.0, 1.0);
-        let (br, bg, bb) = rain_color(load, swap);
-        let (hr, hg, hb) = head_color(load);
+        // Combined "heat" drives the gradient (start -> warning -> critical).
+        let heat = (load + swap * 0.35).clamp(0.0, 1.0);
+        let trail = self.theme.gradient(heat);
+        let head = self.theme.head_color(heat);
 
         let cell = self.cell;
 
-        // Monospace font; centre each glyph horizontally within its cell.
-        ctx.select_font_face("monospace", FontSlant::Normal, FontWeight::Normal);
-        ctx.set_font_size(cell * 0.86);
+        // Monospace font; centre each glyph horizontally within its cell. An
+        // unavailable family silently falls back to the system default here.
+        ctx.select_font_face(&self.theme.font, FontSlant::Normal, FontWeight::Normal);
+        ctx.set_font_size(cell * 0.86 * self.theme.glyph_scale);
         let advance = ctx.text_extents("0").map(|e| e.x_advance()).unwrap_or(cell);
         let x_pad = ((cell - advance) * 0.5).max(0.0);
 
@@ -683,43 +1116,47 @@ impl Visual {
                 if a < 0.04 {
                     continue;
                 }
-                // Leading glyphs render near-white; the tail fades to colour.
-                let (r, g, b) = if a > 0.85 { (hr, hg, hb) } else { (br, bg, bb) };
+                // Leading glyphs render in the highlight colour; the tail fades
+                // through the theme gradient.
+                let c = if a > 0.85 { head } else { trail };
                 let alpha = (a as f64).powf(0.65) * 0.95;
-                ctx.set_source_rgba(r, g, b, alpha);
+                ctx.set_source_rgba(c.r, c.g, c.b, alpha);
                 ctx.move_to(col as f64 * cell + x_pad, y);
                 let _ = ctx.show_text(glyph_str(self.glyph_set, self.glyphs[idx]));
             }
         }
 
         // ---- bloom pass: additive glow on the heads, scaled by pressure ----
-        let bloom = 0.10 + load * 0.55 + self.cache * 0.20;
-        let radius = cell * (0.9 + load * 0.7);
-        let sprite = RadialGradient::new(0.0, 0.0, 0.0, 0.0, 0.0, radius);
-        sprite.add_color_stop_rgba(0.0, br, bg, bb, 0.55 * bloom);
-        sprite.add_color_stop_rgba(0.4, br, bg, bb, 0.18 * bloom);
-        sprite.add_color_stop_rgba(1.0, br, bg, bb, 0.0);
-        ctx.set_operator(Operator::Add);
-        for row in 0..self.rows {
-            for col in 0..self.cols {
-                if self.intens[row * self.cols + col] < 0.9 {
-                    continue;
+        // `--no-bloom` / `bloom = false` skips this loop entirely.
+        if self.theme.bloom && self.theme.bloom_scale > 0.0 {
+            let bloom = (0.10 + load * 0.55 + self.cache * 0.20) * self.theme.bloom_scale;
+            let radius = cell * (0.9 + load * 0.7);
+            let sprite = RadialGradient::new(0.0, 0.0, 0.0, 0.0, 0.0, radius);
+            sprite.add_color_stop_rgba(0.0, trail.r, trail.g, trail.b, 0.55 * bloom);
+            sprite.add_color_stop_rgba(0.4, trail.r, trail.g, trail.b, 0.18 * bloom);
+            sprite.add_color_stop_rgba(1.0, trail.r, trail.g, trail.b, 0.0);
+            ctx.set_operator(Operator::Add);
+            for row in 0..self.rows {
+                for col in 0..self.cols {
+                    if self.intens[row * self.cols + col] < 0.9 {
+                        continue;
+                    }
+                    let x = (col as f64 + 0.5) * cell;
+                    let y = (row as f64 + 0.5) * cell;
+                    let _ = ctx.save();
+                    ctx.translate(x, y);
+                    let _ = ctx.set_source(&sprite);
+                    ctx.arc(0.0, 0.0, radius, 0.0, TAU);
+                    let _ = ctx.fill();
+                    let _ = ctx.restore();
                 }
-                let x = (col as f64 + 0.5) * cell;
-                let y = (row as f64 + 0.5) * cell;
-                let _ = ctx.save();
-                ctx.translate(x, y);
-                let _ = ctx.set_source(&sprite);
-                ctx.arc(0.0, 0.0, radius, 0.0, TAU);
-                let _ = ctx.fill();
-                let _ = ctx.restore();
             }
+            ctx.set_operator(Operator::Over);
         }
-        ctx.set_operator(Operator::Over);
 
         // A very faint full-screen wash that deepens with load (global "glow").
         let wash = 0.015 + load * 0.07;
-        ctx.set_source_rgba(br, bg, bb, wash);
+        ctx.set_source_rgba(trail.r, trail.g, trail.b, wash);
         let _ = ctx.paint();
     }
 }
@@ -865,10 +1302,17 @@ fn build_ui(app: &Application, opts: &Opts, stats: Arc<SharedStats>) {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let (opts, help) = parse_args();
-    if help {
-        print_help();
-        return;
+    let (opts, startup) = parse_args();
+    match startup {
+        Startup::Help => {
+            print_help();
+            return;
+        }
+        Startup::ListThemes => {
+            print_themes();
+            return;
+        }
+        Startup::Run => {}
     }
 
     let stats = Arc::new(SharedStats::default());
@@ -908,9 +1352,11 @@ mod tests {
         let surface = ImageSurface::create(Format::ARgb32, W, H).unwrap();
         let ctx = CairoContext::new(&surface).unwrap();
 
-        let mut opts = Opts::default();
-        opts.cell = 16.0;
-        opts.glyphs = glyphs;
+        let opts = Opts {
+            cell: 16.0,
+            glyphs,
+            ..Opts::default()
+        };
         let mut visual = Visual::new(&opts);
 
         // Feed a synthetic snapshot through the exact same SharedStats slot the
@@ -950,6 +1396,133 @@ mod tests {
             let mut file = std::fs::File::create(&path).unwrap();
             surface.write_to_png(&mut file).unwrap();
             eprintln!("wrote {}", path.display());
+        }
+    }
+
+    #[test]
+    fn hex_colours_parse() {
+        assert_eq!(Rgb::parse_hex("#00ff41"), Some(Rgb::new(0, 255, 65)));
+        assert_eq!(Rgb::parse_hex("00FF41"), Some(Rgb::new(0, 255, 65)));
+        assert_eq!(Rgb::parse_hex(" #0f8 "), Some(Rgb::new(0, 255, 136)));
+        assert_eq!(Rgb::parse_hex("#GG0000"), None);
+        assert_eq!(Rgb::parse_hex("#12345"), None);
+        assert_eq!(Rgb::parse_hex(""), None);
+    }
+
+    #[test]
+    fn every_preset_exists_and_interpolates() {
+        fn approx(a: Rgb, b: Rgb) -> bool {
+            (a.r - b.r).abs() < 1e-9 && (a.g - b.g).abs() < 1e-9 && (a.b - b.b).abs() < 1e-9
+        }
+        for name in Theme::PRESETS {
+            let theme = Theme::preset(name).unwrap_or_else(|| panic!("missing preset {name}"));
+            // The gradient must hit its endpoints and midpoint.
+            assert!(approx(theme.gradient(0.0), theme.start), "start for {name}");
+            assert!(
+                approx(theme.gradient(0.5), theme.warning),
+                "warning for {name}"
+            );
+            assert!(
+                approx(theme.gradient(1.0), theme.critical),
+                "critical for {name}"
+            );
+            assert!(theme.bloom);
+            assert!(theme.glyph_scale > 0.0);
+        }
+        assert!(Theme::preset("definitely-not-a-theme").is_none());
+    }
+
+    #[test]
+    fn overrides_apply_and_clamp() {
+        let mut theme = Theme::preset("matrix").unwrap();
+        let overrides = ThemeOverrides {
+            color_start: Some(Rgb::new(1, 2, 3)),
+            font: Some("Fira Code".to_string()),
+            bloom: Some(false),
+            bloom_scale: Some(-1.0),
+            glyph_scale: Some(99.0),
+            trail_fade: Some(0.0),
+            ..ThemeOverrides::default()
+        };
+        overrides.apply_to(&mut theme);
+        assert_eq!(theme.start, Rgb::new(1, 2, 3));
+        assert_eq!(theme.font, "Fira Code");
+        assert!(!theme.bloom);
+        assert_eq!(theme.bloom_scale, 0.0); // clamped up from -1
+        assert_eq!(theme.glyph_scale, 4.0); // clamped down from 99
+        assert_eq!(theme.trail_fade, 0.05); // clamped up from 0
+    }
+
+    #[test]
+    fn config_file_parses_and_layers_below_cli() {
+        let path = std::env::temp_dir().join(format!(
+            "ramdisplay-test-config-{}.conf",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "# a theme config\n\
+             theme = cyberpunk\n\
+             color-start = #010203\n\
+             font = \"Fira Code\"\n\
+             bloom = no\n\
+             trail-fade = 2.5\n\
+             this line is malformed\n\
+             unknown-key = 5\n",
+        )
+        .unwrap();
+
+        let cfg = load_config(&path, true);
+        assert_eq!(cfg.theme.as_deref(), Some("cyberpunk"));
+        assert_eq!(cfg.overrides.color_start, Some(Rgb::new(1, 2, 3)));
+        assert_eq!(cfg.overrides.font.as_deref(), Some("Fira Code"));
+        assert_eq!(cfg.overrides.bloom, Some(false));
+        assert_eq!(cfg.overrides.trail_fade, Some(2.5));
+
+        // Precedence: config then CLI on top of the preset.
+        let mut theme = Theme::preset(cfg.theme.as_deref().unwrap()).unwrap();
+        cfg.overrides.apply_to(&mut theme);
+        let cli = ThemeOverrides {
+            color_start: Some(Rgb::new(9, 9, 9)),
+            ..ThemeOverrides::default()
+        };
+        cli.apply_to(&mut theme);
+        assert_eq!(theme.start, Rgb::new(9, 9, 9)); // CLI wins
+        assert_eq!(theme.font, "Fira Code"); // config retained
+        assert!(!theme.bloom);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn every_preset_renders_offscreen() {
+        const W: i32 = 320;
+        const H: i32 = 200;
+        for name in Theme::PRESETS {
+            let surface = ImageSurface::create(Format::ARgb32, W, H).unwrap();
+            let ctx = CairoContext::new(&surface).unwrap();
+
+            let opts = Opts {
+                theme: Theme::preset(name).unwrap(),
+                ..Opts::default()
+            };
+            let mut visual = Visual::new(&opts);
+
+            let stats = SharedStats::default();
+            stats.store(&MemSnapshot {
+                total_kb: 100,
+                available_kb: 30,
+                buffers_kb: 0,
+                cached_kb: 20,
+                sreclaimable_kb: 0,
+                swap_total_kb: 100,
+                swap_free_kb: 20,
+            });
+            visual.draw(&ctx, W, H);
+            for _ in 0..90 {
+                visual.update(1.0 / 60.0, &stats);
+            }
+            visual.draw(&ctx, W, H);
         }
     }
 }
